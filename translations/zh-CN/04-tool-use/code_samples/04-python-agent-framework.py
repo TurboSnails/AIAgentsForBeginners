@@ -280,29 +280,78 @@ def book_flight(
 # 6. 主函数：按顺序演示工具使用的各个要点
 # ------------------------------------------------------------------------------
 
-async def main() -> None:
+# ------------------------------------------------------------------------------
+# 6. Demo 单元：每个 demo 独立成函数，main 只负责调度
+# ------------------------------------------------------------------------------
+# 把每一节 demo 封装成独立的 async 函数后，main 只剩"建 client + 顺序
+# await"两件事。新增/跳过某节时只动这一个调度块，不再嵌套 if/else 写
+# 几十行。返回值/异常全部收敛到各 demo 内部，main 不感知细节。
+
+
+def _print_travel_plan(plan: "TravelPlan", header: str) -> None:
+    """统一打印 TravelPlan 的辅助函数。"""
+    print(header)
+    for rec in plan.recommendations:
+        print(
+            f"  - {rec.destination} | available={rec.available} | "
+            f"flight={rec.flight_details} | cost=${rec.estimated_cost}"
+        )
+
+
+def _looks_like_json_object(text: str) -> bool:
+    """粗判：字符串首尾是否像单个 JSON 对象。"""
+    if not text:
+        return False
+    stripped = text.strip()
+    return stripped.startswith("{") and stripped.rstrip().endswith("}")
+
+
+def _extract_structured_tool_args(response) -> str | None:
+    """在 response 的 messages 中寻找最后一条 function_call 的 JSON 参数。
+
+    当 provider 不支持 `response_format` 时，OpenAICompatChatClient 会把
+    schema 塞进虚拟 tool `submit_structured_output`，模型的最终 JSON 就
+    出现在该 tool_call 的 arguments 字段里。函数会扫描 response 里所有
+    messages（包括 user/assistant/tool result），返回第一条看起来像合法
+    JSON 对象的 arguments 字符串；找不到返回 None。
     """
-    主入口：依次演示：
-    1. 使用 @tool 装饰器定义工具
-    2. 创建一个带有多个工具的智能体
-    3. 工具调用的结构化输出（Pydantic + response_format）
-    4. 工具的审批模式（approval_mode）
+    import json as _json
+
+    messages = getattr(response, "messages", None) or []
+    for msg in reversed(messages):
+        contents = getattr(msg, "contents", None) or []
+        for c in contents:
+            ctype = getattr(c, "type", None)
+            name = getattr(c, "name", None)
+            if ctype == "function_call" and name == "submit_structured_output":
+                args = getattr(c, "arguments", None)
+                if isinstance(args, str):
+                    try:
+                        _json.loads(args)
+                        return args
+                    except _json.JSONDecodeError:
+                        continue
+                if isinstance(args, dict):
+                    return _json.dumps(args, ensure_ascii=False)
+    return None
+
+def _try_parse_travel_plan(response, raw_text: str) -> "TravelPlan | None":
+    """解析 TravelPlan：先看 response.text，再回退到虚拟 tool 参数。
+
+    返回解析后的 TravelPlan；解析失败返回 None，由调用方决定如何降级
+    打印告警。
     """
+    candidate = raw_text
+    if not _looks_like_json_object(candidate):
+        candidate = _extract_structured_tool_args(response) or candidate
+    try:
+        return TravelPlan.model_validate_json(candidate)
+    except Exception:
+        return None
 
-    # --- 步骤 A：加载环境变量并创建 Chat Client ---
-    _load_env()
-    chat_client = _create_chat_client()
 
-    # ==================================================================
-    # 6.1 工具定义（@tool 装饰器）
-    # ==================================================================
-    # 关键点：
-    #   - 文档字符串 = 工具描述，模型据此判断何时调用
-    #   - 类型注解 + Annotated 描述 = 工具参数模式
-    #   - approval_mode 控制是否需要人工批准
-    # 上方已经定义了 4 个工具：get_destinations / check_availability /
-    # get_flight_info / book_flight。本节仅打印其元信息以便回顾。
-
+async def demo_section1_tool_definitions() -> None:
+    """第1节：展示 @tool 装饰器定义的工具元信息（name / approval_mode）。"""
     print("=" * 60)
     print("Section 1: Tools defined with @tool")
     print("第1节：使用 @tool 定义工具")
@@ -311,18 +360,13 @@ async def main() -> None:
         print(f"- {t.name}  approval_mode={t.approval_mode}")
     print()
 
-    # ==================================================================
-    # 6.2 创建一个带多个工具的智能体
-    # ==================================================================
-    # 把工具打包成列表传给 chat_client.as_agent(tools=...)。
-    # 智能体在回答时会按需选择调用哪个工具，并可以串联多个工具的结果。
 
+async def demo_section2_multi_tool_agent(chat_client) -> None:
+    """第2节：把多个工具挂到同一个 agent，演示模型自主选工具。"""
     print("=" * 60)
     print("Section 2: Agent with multiple tools")
     print("第2节：组合多个工具")
     print("=" * 60)
-
-    travel_tools = [get_destinations, check_availability, get_flight_info]
 
     travel_agent = chat_client.as_agent(
         name="TravelToolAgent",
@@ -331,7 +375,7 @@ async def main() -> None:
             "questions about destinations, availability, and flights. "
             "你是一名旅行代理。请使用可用工具回答关于目的地、可用性和航班的问题。"
         ),
-        tools=travel_tools,
+        tools=[get_destinations, check_availability, get_flight_info],
     )
 
     response = await travel_agent.run(
@@ -340,13 +384,9 @@ async def main() -> None:
     print(response)
     print()
 
-    # ==================================================================
-    # 6.3 工具调用的结构化输出
-    # ==================================================================
-    # 把 Pydantic 模型作为 response_format 传入，会让大模型按 JSON Schema
-    # 输出，并被框架自动反序列化为 Python 对象。下游代码可以安全地
-    # response.recommendations[0].destination 这样访问字段。
 
+async def demo_section3_structured_output(chat_client) -> None:
+    """第3节：tools + response_format，单阶段结构化输出（兼容虚拟 tool 路径）。"""
     print("=" * 60)
     print("Section 3: Structured output from tool-using agent")
     print("第3节：使用工具的结构化输出")
@@ -383,49 +423,52 @@ async def main() -> None:
         options={"response_format": TravelPlan},
     )
 
-    if response:
-        # 重要：不要触碰 `response.value` —— 它是 @property，访问即触发
-        # Pydantic 校验，模型一旦没返回合规 JSON 就会把整个 asyncio.run
-        # 拖崩。在 `tools + response_format` 组合下，Qwen 系模型常会先
-        # 讲一段自然语言再调工具，最后忘了把结论收成 JSON。这是模型
-        # 行为问题，客户端层没法兜，必须在脚本里做防御。
-        #
-        # 正确做法：直接拿 response.text，自己调 Pydantic 解析；失败则
-        # 降级打印原始文本，保留可观察性，而不是炸进程。
-        raw_text = response.text or ""
-        print("--- raw model output (response_format=TravelPlan) ---")
-        print(raw_text)
-        print("--- end raw ---")
-        try:
-            plan = TravelPlan.model_validate_json(raw_text)
-            print("\nParsed TravelPlan:")
-            for rec in plan.recommendations:
-                print(
-                    f"  - {rec.destination} | available={rec.available} | "
-                    f"flight={rec.flight_details} | cost=${rec.estimated_cost}"
-                )
-        except Exception as exc:
-            # 解析失败时给出明确提示 + 模型原始输出，便于学习者诊断
-            print(
-                "\n[WARN] 模型未返回符合 TravelPlan 的 JSON（"
-                f"{type(exc).__name__}: {exc}）。"
-                "这通常是模型在 tools + response_format 组合下没遵守 schema 约束；"
-                "可换用支持 json_schema strict 模式的模型，或拆成『先 tool 拿数据、"
-                "再单独一次 run 拿结构化输出』两阶段。"
-            )
+    if not response:
+        return
+
+    # 重要：不要触碰 `response.value` —— 它是 @property，访问即触发
+    # Pydantic 校验，模型一旦没返回合规 JSON 就会把整个 asyncio.run
+    # 拖崩。在 `tools + response_format` 组合下，Qwen 系模型常会先
+    # 讲一段自然语言再调工具，最后忘了把结论收成 JSON。这是模型
+    # 行为问题，客户端层没法兜，必须在脚本里做防御。
+    #
+    # 正确做法：直接拿 response.text，自己调 Pydantic 解析；失败则
+    # 降级打印原始文本，保留可观察性，而不是炸进程。
+    raw_text = response.text or ""
+    print("--- raw model output (response_format=TravelPlan) ---")
+    print(raw_text)
+    print("--- end raw ---")
+
+    # 兼容路径：MiniMax 等不支持 response_format 的提供商会让客户端把
+    # schema 塞进虚拟 tool `submit_structured_output`，模型以 tool_call
+    # 形式返回 JSON。这种情况下 response.text 是空或自然语言尾巴，
+    # 真正的 JSON 在最后一条 function_call.arguments 里。
+    plan = _try_parse_travel_plan(response, raw_text)
+    if plan is not None:
+        _print_travel_plan(plan, "\nParsed TravelPlan:")
+    else:
+        print(
+            "\n[WARN] 模型未返回符合 TravelPlan 的 JSON。"
+            "这通常是模型在 tools + response_format 组合下没遵守 schema 约束；"
+            "可换用支持 json_schema strict 模式的模型，或拆成『先 tool 拿数据、"
+            "再单独一次 run 拿结构化输出』两阶段。"
+        )
     print()
 
-    # ------------------------------------------------------------------
-    # 3.1 进阶：两阶段写法（兼容所有 OpenAI-compatible 模型）
-    # ------------------------------------------------------------------
-    # 当模型不严格遵守 json_schema 时，把"拿数据"和"产出结构化结果"拆成
-    # 两次 run，第二次没有 tools，模型更容易乖乖吐 JSON。这种模式在
-    # Lesson 05+ 的多智能体 / RAG 场景里会被反复用到。
+
+async def demo_section3_1_two_phase(chat_client) -> None:
+    """第3.1节：两阶段写法（兼容所有 OpenAI-compatible 模型）。
+
+    当模型不严格遵守 json_schema 时，把"拿数据"和"产出结构化结果"拆成
+    两次 run，第二次没有 tools，模型更容易乖乖吐 JSON。这种模式在
+    Lesson 05+ 的多智能体 / RAG 场景里会被反复用到。
+    """
     print("-" * 60)
     print("Section 3.1: Two-phase pattern (robust across providers)")
     print("第3.1节：两阶段写法（跨提供商稳健）")
     print("-" * 60)
 
+    # 阶段 1：拿数据，自然语言总结
     gather_agent = chat_client.as_agent(
         name="TravelGatherer",
         instructions=(
@@ -445,7 +488,7 @@ async def main() -> None:
     print(gathered_text)
     print()
 
-    # 第二次 run：把第一阶段结果喂回去，要求严格 JSON 输出
+    # 阶段 2：不带 tools，强制 JSON
     formatter_agent = chat_client.as_agent(
         name="TravelFormatter",
         instructions=(
@@ -463,28 +506,19 @@ async def main() -> None:
     )
     if formatted:
         raw_text2 = formatted.text or ""
-        try:
-            plan2 = TravelPlan.model_validate_json(raw_text2)
-            print("Phase 2 parsed TravelPlan:")
-            for rec in plan2.recommendations:
-                print(
-                    f"  - {rec.destination} | available={rec.available} | "
-                    f"flight={rec.flight_details} | cost=${rec.estimated_cost}"
-                )
-        except Exception as exc:
+        plan2 = _try_parse_travel_plan(formatted, raw_text2)
+        if plan2 is not None:
+            _print_travel_plan(plan2, "Phase 2 parsed TravelPlan:")
+        else:
             print(
-                f"[WARN] 第二阶段仍未得到合规 JSON: {type(exc).__name__}: {exc}\n"
+                f"[WARN] 第二阶段仍未得到合规 JSON\n"
                 f"raw: {raw_text2[:400]}"
             )
     print()
 
-    # ==================================================================
-    # 6.4 工具的审批模式
-    # ==================================================================
-    # approval_mode="always_require" 的工具在被调用前会触发人工审批流程。
-    # 适合具有副作用的操作（预订、扣款、发送消息等）。
-    # 本节仅展示 book_flight 的元信息，并演示一次"模拟审批后"的调用路径。
 
+async def demo_section4_approval_mode(chat_client) -> None:
+    """第4节：approval_mode=always_require 触发人工审批。"""
     print("=" * 60)
     print("Section 4: Tool approval mode")
     print("第4节：工具审批模式")
@@ -512,9 +546,9 @@ async def main() -> None:
     print(response)
     print()
 
-    # ==================================================================
-    # 总结
-    # ==================================================================
+
+async def demo_summary() -> None:
+    """结尾：四节要点回顾。"""
     print("=" * 60)
     print("Summary")
     print("总结")
@@ -525,6 +559,26 @@ async def main() -> None:
         "3. 通过 response_format=PydanticModel 返回结构化输出；\n"
         "4. 通过 approval_mode 控制工具是否需要人工审批。"
     )
+
+
+async def main() -> None:
+    """
+    主入口：依次演示：
+    1. 使用 @tool 装饰器定义工具
+    2. 创建一个带有多个工具的智能体
+    3. 工具调用的结构化输出（Pydantic + response_format）
+    4. 工具的审批模式（approval_mode）
+    """
+    _load_env()
+    chat_client = _create_chat_client()
+
+    # 顺序与 1/2/3/3.1/4 一致；要跳过某节，注释掉对应行即可
+    # await demo_section1_tool_definitions()
+    # await demo_section2_multi_tool_agent(chat_client)
+    await demo_section3_structured_output(chat_client)
+    # await demo_section3_1_two_phase(chat_client)
+    # await demo_section4_approval_mode(chat_client)
+    # await demo_summary()
 
 
 # ------------------------------------------------------------------------------
