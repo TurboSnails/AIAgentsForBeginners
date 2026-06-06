@@ -229,37 +229,37 @@ class OpenAICompatChatClient(FunctionInvocationLayer, BaseChatClient):
         # 仅在网络层瞬时错误（超时、断连、协议错误）下重试；
         # 收到 4xx/5xx 直接跳出循环，由下方统一报错 —— 重试没意义。
         attempts = self._max_retries + 1
-        for attempt in range(1, attempts + 1):
-            try:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            for attempt in range(1, attempts + 1):
+                try:
                     resp = await client.post(
                         f"{self._base_url}/chat/completions",
                         headers=headers,
                         json=payload,
                     )
-                break  # 拿到响应就跳出（哪怕是 4xx），不再重试
-            except (
-                httpx.TimeoutException,
-                httpx.NetworkError,
-                httpx.RemoteProtocolError,
-            ) as exc:
-                # 已经用完所有重试次数 → 抛汇总异常
-                if attempt >= attempts:
-                    raise RuntimeError(
-                        f"Chat completions request failed after {attempts} "
-                        f"attempt(s) (model={self.model}): {exc}"
-                    ) from exc
-                # 指数退避，封顶 8s
-                backoff = min(2 ** (attempt - 1), 8)
-                logger.warning(
-                    "Chat completions transient error (attempt %d/%d): %s. "
-                    "Retrying in %ds.",
-                    attempt,
-                    attempts,
-                    exc,
-                    backoff,
-                )
-                await asyncio.sleep(backoff)
+                    break  # 拿到响应就跳出（哪怕是 4xx），不再重试
+                except (
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                    httpx.RemoteProtocolError,
+                ) as exc:
+                    # 已经用完所有重试次数 → 抛汇总异常
+                    if attempt >= attempts:
+                        raise RuntimeError(
+                            f"Chat completions request failed after {attempts} "
+                            f"attempt(s) (model={self.model}): {exc}"
+                        ) from exc
+                    # 指数退避，封顶 8s
+                    backoff = min(2 ** (attempt - 1), 8)
+                    logger.warning(
+                        "Chat completions transient error (attempt %d/%d): %s. "
+                        "Retrying in %ds.",
+                        attempt,
+                        attempts,
+                        exc,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
 
         # 4xx / 5xx：把服务端返回的 error body 原样带上抛出去，
         # 远比一个泛化的 exception 容易排查。
@@ -379,21 +379,25 @@ class OpenAICompatChatClient(FunctionInvocationLayer, BaseChatClient):
                         "type": "function",
                         "function": {"name": virtual_name},
                     }
-                    # 在消息最前面补一条 system 指令，避免模型忽略 tool_choice
-                    chat_messages.insert(
-                        0,
-                        {
-                            "role": "system",
-                            "content": (
-                                "When the user's request requires a "
-                                "structured response, you MUST call the "
-                                "`submit_structured_output` tool with a "
-                                "JSON object that matches its schema. Do "
-                                "NOT respond with free-form text or "
-                                "markdown in that case."
-                            ),
-                        },
+                    # 补一条 system 指令，避免模型忽略 tool_choice。
+                    # 若开头已有 system 消息则追加到其 content，
+                    # 否则插入新条目，避免产生两条 system 消息。
+                    _instruction = (
+                        "When the user's request requires a "
+                        "structured response, you MUST call the "
+                        "`submit_structured_output` tool with a "
+                        "JSON object that matches its schema. Do "
+                        "NOT respond with free-form text or "
+                        "markdown in that case."
                     )
+                    if chat_messages and chat_messages[0].get("role") == "system":
+                        chat_messages[0]["content"] = (
+                            chat_messages[0]["content"] + "\n\n" + _instruction
+                        )
+                    else:
+                        chat_messages.insert(
+                            0, {"role": "system", "content": _instruction}
+                        )
                     logger.info(
                         "Injected virtual tool `submit_structured_output` "
                         "with inline schema (no $ref) for structured output."
@@ -482,32 +486,19 @@ class OpenAICompatChatClient(FunctionInvocationLayer, BaseChatClient):
         if tool_results:
             out.extend(tool_results)
 
-        # 2) 有 tool_calls → 走 assistant 消息（带 tool_calls 字段）
+        # 2) assistant + tool_calls
         if tool_calls:
-            assistant_msg = {
+            out.append({
                 "role": "assistant",
                 "content": "".join(text_parts) or None,
                 "tool_calls": tool_calls,
-            }
-            out.append(assistant_msg)
-        # 3) 纯文本 assistant 消息
-        elif text_parts and role == "assistant":
-            assistant_msg = {
-                "role": "assistant",
-                "content": "".join(text_parts),
-            }
-            out.append(assistant_msg)
-
-        # 4) 纯文本 user / system / developer 消息
-        #    上面 2/3 都不会走到这里（因为那时 tool_calls 已经有内容），
-        #    所以这里只处理"纯文本"这一支。
-        if text_parts and not tool_calls and not tool_results:
-            out.append(
-                {
-                    "role": self._map_role(role),
-                    "content": "".join(text_parts),
-                }
-            )
+            })
+        # 3) 纯文本 assistant
+        elif role == "assistant" and text_parts:
+            out.append({"role": "assistant", "content": "".join(text_parts)})
+        # 4) 纯文本 user / system / developer
+        elif text_parts:
+            out.append({"role": self._map_role(role), "content": "".join(text_parts)})
 
         return out
 
@@ -761,6 +752,7 @@ def _inline_json_schema_refs(schema: dict[str, Any]) -> dict[str, Any]:
 
     返回：完全 self-contained、不含 `$ref`/`$defs` 的 schema dict。
     """
+    schema = dict(schema)  # 浅拷贝，避免原地 mutate 调用方传入的对象
     defs: dict[str, Any] = schema.pop("$defs", {})
     expanding: set[str] = set()
 
