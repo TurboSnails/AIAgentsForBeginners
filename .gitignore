@@ -1,0 +1,34 @@
+# 环境变量 / 凭据
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+
+# 翻译流水线临时文件
+translations/*/code_samples/__pycache__/
+translations/*/code_samples/*.pyc
+
+# 备份 notebook
+*-backup.ipynb
+.ipynb_checkpoints/
+
+# 翻译工作流本地产物
+.co-op-translator.local.*
