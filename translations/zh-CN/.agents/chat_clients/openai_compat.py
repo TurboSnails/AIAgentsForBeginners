@@ -477,6 +477,53 @@ class OpenAICompatChatClient(FunctionInvocationLayer, BaseChatClient):
                         else json.dumps(c.result or "", ensure_ascii=False),
                     }
                 )
+            elif ctype == "function_approval_request" and c.function_call is not None:
+                # approval_mode="always_require" 走的两轮 run 协议：
+                # 第 1 轮模型发出 tool_call，框架拦截、把 function_call 包成
+                # function_approval_request 留在 assistant 消息里。
+                # OpenAI chat 协议不知道 approval_request 这个概念；
+                # 我们必须在 wire 上还原回一个普通 function_call，否则
+                # MiniMax 之类的服务在第 2 轮收不到对应的 tool_call_id，
+                # 会回 400 `tool result's tool id ... not found`。
+                # 用 function_call 自身的 call_id 保持一致。
+                fc = c.function_call
+                args = fc.arguments
+                if isinstance(args, Mapping):
+                    args_str = json.dumps(args, ensure_ascii=False)
+                else:
+                    args_str = args or "{}"
+                tool_calls.append(
+                    {
+                        "id": fc.call_id or c.id or "",
+                        "type": "function",
+                        "function": {
+                            "name": fc.name,
+                            "arguments": args_str,
+                        },
+                    }
+                )
+            elif ctype == "function_approval_response" and c.function_call is not None:
+                # 第 2 轮里调用方传进来的"批准"内容。framework 的
+                # _process_function_requests 会在 _get_response 之前
+                # 把它就地替换成 function_result（msg.role="tool"），
+                # 所以正常情况下走到 _convert_message 的应该是
+                # function_result content，不是 approval_response。
+                #
+                # 但如果调用方在 _get_response 之外（比如直接在 chat
+                # client 上）拿这条消息发出去，就仍然会看到
+                # approval_response；此时我们把它当"工具被拒绝"翻译成
+                # 一条 role=tool 的消息，content 写明拒绝原因。
+                tool_results.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": c.function_call.call_id or c.id or "",
+                        "content": (
+                            "Error: Tool call invocation was rejected by user."
+                            if not getattr(c, "approved", False)
+                            else "Error: approval response received but no matching tool execution result was produced."
+                        ),
+                    }
+                )
             # 其他 content 类型（图片、文件、hosted vector 等）本客户端
             # 主动忽略 —— 课程 notebook 只用到文本 + 工具调用。
 

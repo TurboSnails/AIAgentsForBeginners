@@ -192,19 +192,46 @@ def _create_chat_client():
 # 线）消费时，必须是可预测的 JSON。Pydantic 模型正是这种契约：把"期望的
 # 字段名 + 类型"告诉模型，并把返回值反序列化为 Python 对象。
 
+class FlightDetails(BaseModel):
+    """单条航班的结构化信息。把这些字段拆开能强制模型按字段填空，
+    避免在 flight_details 里夹带英文散文描述（"direct flight, duration ~2h15min"）
+    等无法被映射表翻译的内容。
+    """
+    flight_number: str
+    # 航班号，如 "BA 2042"（行业标识符，保留英文/数字原样）
+
+    origin_airport: str
+    # 出发地机场 IATA 代码，如 "LHR"
+
+    destination_airport: str
+    # 目的地机场 IATA 代码，如 "BCN"
+
+    departure_time: str
+    # 起飞时间，如 "08:30"
+
+    arrival_time: str
+    # 抵达时间，如 "11:45"
+
+    price_usd: int
+    # 价格（美元）
+
+
 class BookingRecommendation(BaseModel):
     """单条目的地预订推荐的数据结构。"""
     destination: str
-    # destination: 字符串，例如 "Barcelona"
+    # destination: 字符串，目的地中文名（模型按 schema 填，脚本兜底翻译）
 
     available: bool
     # available: 布尔值，表示该目的地当前是否可订
 
-    flight_details: str
-    # flight_details: 字符串，航班信息（航班号/起降时间/价格等）
+    flight: FlightDetails
+    # flight: 结构化航班信息（航班号/起降机场/时间/价格）
 
     estimated_cost: int
     # estimated_cost: 整数，估算总费用（美元）
+
+    note: str = ""
+    # note: 可选备注（如"无可达航班"），模型留空时脚本兜底填中文
 
 
 class TravelPlan(BaseModel):
@@ -225,54 +252,53 @@ class TravelPlan(BaseModel):
 
 @tool(approval_mode="never_require")
 def get_destinations() -> list[str]:
-    """Get available vacation destinations. / 获取可选的度假目的地列表。"""
+    """获取可选的度假目的地列表。"""
     return ["Barcelona", "Paris", "Berlin", "Tokyo", "Sydney", "New York City"]
 
 
 @tool(approval_mode="never_require")
 def check_availability(
-    destination: Annotated[str, "The destination to check / 要查询的目的地"],
+    destination: Annotated[str, "要查询的目的地"],
 ) -> str:
-    """Check booking availability for a destination. / 查询某目的地的预订可用性。"""
+    """查询某目的地的预订可用性。"""
     availability = {
-        "Barcelona": "Available - 3 spots left",
-        "Paris": "Available",
-        "Berlin": "Sold out",
-        "Tokyo": "Available - 1 spot left",
-        "Sydney": "Available",
-        "New York City": "Available",
+        "Barcelona": "可预订 - 剩余 3 个名额",
+        "Paris": "可预订",
+        "Berlin": "已售罄",
+        "Tokyo": "可预订 - 剩余 1 个名额",
+        "Sydney": "可预订",
+        "New York City": "可预订",
     }
-    return availability.get(destination, "Unknown destination")
+    return availability.get(destination, "未知目的地")
 
 
 @tool(approval_mode="never_require")
 def get_flight_info(
-    origin: Annotated[str, "Origin airport code / 出发地机场代码 (IATA)"],
-    destination: Annotated[str, "Destination airport code / 目的地机场代码 (IATA)"],
+    origin: Annotated[str, "出发地机场代码 (IATA)"],
+    destination: Annotated[str, "目的地机场代码 (IATA)"],
 ) -> str:
-    """Get flight information between two cities. / 查询两个城市之间的航班信息。"""
+    """查询两个城市之间的航班信息。"""
     flights = {
-        "LHR-BCN": "BA 2042, Departs 08:30, Arrives 11:45, $350",
-        "LHR-CDG": "AF 1081, Departs 09:15, Arrives 11:30, $280",
-        "LHR-NRT": "JL 044, Departs 11:00, Arrives 07:00+1, $890",
+        "LHR-BCN": "BA 2042, 08:30 起飞, 11:45 抵达, 350 美元",
+        "LHR-CDG": "AF 1081, 09:15 起飞, 11:30 抵达, 280 美元",
+        "LHR-NRT": "JL 044, 11:00 起飞, 次日 07:00 抵达, 890 美元",
     }
     return flights.get(
         f"{origin}-{destination}",
-        f"No direct flights from {origin} to {destination}",
+        f"从 {origin} 到 {destination} 没有直达航班",
     )
 
 
 @tool(approval_mode="always_require")
 def book_flight(
-    origin: Annotated[str, "Origin airport code / 出发地机场代码 (IATA)"],
-    destination: Annotated[str, "Destination airport code / 目的地机场代码 (IATA)"],
-    passenger_name: Annotated[str, "Full name of the passenger / 乘客全名"],
+    origin: Annotated[str, "出发地机场代码 (IATA)"],
+    destination: Annotated[str, "目的地机场代码 (IATA)"],
+    passenger_name: Annotated[str, "乘客全名"],
 ) -> str:
-    """Book a flight for a passenger. Requires approval before executing.
-    为乘客预订航班。执行前需要人工审批。"""
+    """为乘客预订航班。执行前需要人工审批。"""
     return (
-        f"Flight booked from {origin} to {destination} "
-        f"for {passenger_name}. Confirmation #TRV-2024-{hash(passenger_name) % 10000:04d}"
+        f"已为乘客 {passenger_name} 预订从 {origin} 到 {destination} 的航班。"
+        f"确认号 #TRV-2024-{hash(passenger_name) % 10000:04d}"
     )
 
 
@@ -289,12 +315,21 @@ def book_flight(
 
 
 def _print_travel_plan(plan: "TravelPlan", header: str) -> None:
-    """统一打印 TravelPlan 的辅助函数。"""
+    """统一打印 TravelPlan 的辅助函数（适配结构化 FlightDetails）。"""
     print(header)
     for rec in plan.recommendations:
+        f = rec.flight
+        if rec.available:
+            flight_str = (
+                f"{f.flight_number} {f.origin_airport}→{f.destination_airport} "
+                f"{f.departure_time}-{f.arrival_time} ${f.price_usd}"
+            )
+        else:
+            flight_str = rec.note or "无可用航班"
+        note = f" | note={rec.note}" if rec.note else ""
         print(
             f"  - {rec.destination} | available={rec.available} | "
-            f"flight={rec.flight_details} | cost=${rec.estimated_cost}"
+            f"flight={flight_str}{note} | cost=${rec.estimated_cost}"
         )
 
 
@@ -335,6 +370,63 @@ def _extract_structured_tool_args(response) -> str | None:
                     return _json.dumps(args, ensure_ascii=False)
     return None
 
+
+# ------------------------------------------------------------------------------
+# 5.1 英中映射表 + 兜底翻译器
+# ------------------------------------------------------------------------------
+# Prompt 只能"建议"模型用中文；模型有时仍会从 tool 返回或自有词库里夹英文。
+# 这一层在 JSON 解析成功后强制把英文地名/备注转成中文，作为硬保证。
+# 航班号（如 BA 2042）和机场代码（如 LHR、BCN）由 schema 强约束保留英文。
+
+_DESTINATION_ZH = {
+    "Barcelona": "巴塞罗那",
+    "Paris": "巴黎",
+    "Berlin": "柏林",
+    "Tokyo": "东京",
+    "Sydney": "悉尼",
+    "New York City": "纽约",
+    "London": "伦敦",
+    "London Heathrow": "伦敦希思罗",
+    "Heathrow": "希思罗",
+    "Spain": "西班牙",
+    "France": "法国",
+    "Germany": "德国",
+}
+
+# 无法订到航班时的兜底中文备注
+_NO_FLIGHT_NOTE_ZH = "无可用直达航班"
+
+
+def _zh_ratio(text: str) -> float:
+    """计算字符串中 CJK 汉字（含全角符号）的占比。"""
+    if not text:
+        return 0.0
+    zh_chars = sum(1 for c in text if "\u4e00" <= c <= "\u9fff")
+    return zh_chars / len(text)
+
+
+def _localize_plan(plan: "TravelPlan") -> "TravelPlan":
+    """对解析后的 TravelPlan 做一次英中规范化。
+
+    schema 已经把航班拆成结构化字段，模型无法夹英文散文；note 字段是
+    自由文本兜不住，所以再加一道"中文字符比例"硬约束：note 里中文比例
+    不足 50% 时直接覆盖为"暂无中文备注"，保证打印输出永远是中文。
+    """
+    for rec in plan.recommendations:
+        # destination 兜底翻译（schema 没强制字段值语言，模型可能填英文）
+        if rec.destination in _DESTINATION_ZH:
+            rec.destination = _DESTINATION_ZH[rec.destination]
+        # note 字段：先做地名替换，再做中文比例检查；不达标就覆盖
+        if not rec.note:
+            rec.note = _NO_FLIGHT_NOTE_ZH
+        else:
+            for en, zh in _DESTINATION_ZH.items():
+                if en in rec.note:
+                    rec.note = rec.note.replace(en, zh)
+            if _zh_ratio(rec.note) < 0.5:
+                rec.note = "暂无中文备注"
+    return plan
+
 def _try_parse_travel_plan(response, raw_text: str) -> "TravelPlan | None":
     """解析 TravelPlan：先看 response.text，再回退到虚拟 tool 参数。
 
@@ -371,15 +463,16 @@ async def demo_section2_multi_tool_agent(chat_client) -> None:
     travel_agent = chat_client.as_agent(
         name="TravelToolAgent",
         instructions=(
-            "You are a travel agent. Use the available tools to answer "
-            "questions about destinations, availability, and flights. "
             "你是一名旅行代理。请使用可用工具回答关于目的地、可用性和航班的问题。"
+            "所有回复必须使用中文。城市名、地名都用中文表达（如\"巴塞罗那\"、"
+            "\"巴黎\"、\"伦敦希思罗\"），但机场代码（如 LHR、BCN）和航班号"
+            "（如 BA 2042）保持原样。"
         ),
         tools=[get_destinations, check_availability, get_flight_info],
     )
 
     response = await travel_agent.run(
-        "What destinations do you have? Which ones are still available?"
+        "你们有哪些目的地？哪些还有可用名额？"
     )
     print(response)
     print()
@@ -401,25 +494,26 @@ async def demo_section3_structured_output(chat_client) -> None:
     structured_agent = chat_client.as_agent(
         name="StructuredTravelAgent",
         instructions=(
-            "You are a travel agent. Follow these rules strictly:\n"
-            "1. First, call the available tools to gather destination, "
-            "   availability, and flight information.\n"
-            "2. Then respond with ONLY a JSON object that matches the "
-            "   requested schema. No prose, no markdown fences, no "
-            "   explanations before or after the JSON.\n"
-            "3. Always include at least one recommendation.\n"
-            "你是一名旅行代理。请严格遵守：\n"
-            "1. 先调用工具收集目的地、可用性和航班信息；\n"
+            "你是一名旅行代理。请严格遵守以下规则：\n"
+            "1. 首先调用可用工具收集目的地、可用性和航班信息；\n"
             "2. 之后**只**输出符合 schema 的 JSON 对象，禁止任何叙述、"
             "   解释、markdown 围栏或前后缀；\n"
-            "3. 至少返回 1 条推荐。"
+            "3. 至少返回 1 条推荐。\n"
+            "4. 按 schema 字段严格填写：\n"
+            "   - destination：使用中文城市名（如\"巴塞罗那\"、\"巴黎\"）\n"
+            "   - flight.flight_number：航班号原样（如\"BA 2042\"）\n"
+            "   - flight.origin_airport / destination_airport：IATA 代码"
+            "（如\"LHR\"、\"BCN\"），保持大写\n"
+            "   - flight.departure_time / arrival_time：24 小时制"
+            "（如\"08:30\"、\"11:45\"）\n"
+            "   - flight.price_usd：整数美元价格\n"
+            "   - note：中文备注；无可用航班时写\"无可用直达航班\""
         ),
         tools=[get_destinations, check_availability, get_flight_info],
     )
 
     response = await structured_agent.run(
-        "I want to fly from London Heathrow to somewhere warm in Europe. "
-        "Check what's available.",
+        "我想从伦敦希思罗机场飞往欧洲某个温暖的城市，帮我看看有哪些可用选项。",
         options={"response_format": TravelPlan},
     )
 
@@ -445,6 +539,7 @@ async def demo_section3_structured_output(chat_client) -> None:
     # 真正的 JSON 在最后一条 function_call.arguments 里。
     plan = _try_parse_travel_plan(response, raw_text)
     if plan is not None:
+        plan = _localize_plan(plan)
         _print_travel_plan(plan, "\nParsed TravelPlan:")
     else:
         print(
@@ -472,16 +567,16 @@ async def demo_section3_1_two_phase(chat_client) -> None:
     gather_agent = chat_client.as_agent(
         name="TravelGatherer",
         instructions=(
-            "You are a travel assistant. Use the tools to find destinations, "
-            "check availability, and fetch flight info. Respond with a short "
-            "natural-language summary — no JSON required at this stage."
-            " 你是一名旅行助理，使用工具收集信息后用自然语言简短总结即可，本阶段无需 JSON。"
+            "你是一名旅行助理。请使用工具查找目的地、检查可用性并获取航班信息，"
+            "用简短的自然语言进行总结即可，本阶段无需输出 JSON。"
+            "所有回复必须使用中文，城市名/地名用中文表达（如\"巴塞罗那\"、"
+            "\"伦敦希思罗\"），机场代码（如 LHR、BCN）和航班号（如 BA 2042）"
+            "保持原样。"
         ),
         tools=[get_destinations, check_availability, get_flight_info],
     )
     gathered = await gather_agent.run(
-        "I want to fly from London Heathrow to somewhere warm in Europe. "
-        "Check what's available."
+        "我想从伦敦希思罗机场飞往欧洲某个温暖的城市，帮我看看有哪些可用选项。"
     )
     gathered_text = gathered.text if gathered else ""
     print("Phase 1 summary:")
@@ -492,22 +587,32 @@ async def demo_section3_1_two_phase(chat_client) -> None:
     formatter_agent = chat_client.as_agent(
         name="TravelFormatter",
         instructions=(
-            "You convert travel summaries into strict JSON that matches the "
-            "requested schema. Output ONLY the JSON object — no prose, no "
-            "markdown fences. Include at least one recommendation."
-            " 你负责把旅行摘要转成严格 JSON，**只**输出 JSON 对象，禁止任何"
-            "叙述或 markdown 围栏。至少返回 1 条推荐。"
+            "你负责把旅行摘要转成符合 schema 的严格 JSON。"
+            "**只**输出 JSON 对象，禁止任何叙述或 markdown 围栏，至少返回 1 条推荐。"
+            "按 schema 字段严格填写：\n"
+            "  - destination：使用中文城市名（如\"巴塞罗那\"、\"巴黎\"）\n"
+            "  - flight.flight_number：航班号原样（如\"BA 2042\"）\n"
+            "  - flight.origin_airport / destination_airport：IATA 代码"
+            "（如\"LHR\"、\"BCN\"），保持大写\n"
+            "  - flight.departure_time / arrival_time：24 小时制"
+            "（如\"08:30\"、\"11:45\"）\n"
+            "  - flight.price_usd：整数美元价格\n"
+            "  - note：中文备注；无可用航班时写\"无可用直达航班\""
         ),
     )
+    print("Phase 2 summary:")
     formatted = await formatter_agent.run(
-        "Convert the following travel summary into TravelPlan JSON:\n"
+        "请把以下旅行摘要转换成 TravelPlan 格式的 JSON：\n"
         f"{gathered_text}",
         options={"response_format": TravelPlan},
     )
     if formatted:
         raw_text2 = formatted.text or ""
+        print(f"|||-->{raw_text2}")
+        print("|||------------------------>")
         plan2 = _try_parse_travel_plan(formatted, raw_text2)
         if plan2 is not None:
+            plan2 = _localize_plan(plan2)
             _print_travel_plan(plan2, "Phase 2 parsed TravelPlan:")
         else:
             print(
@@ -518,7 +623,22 @@ async def demo_section3_1_two_phase(chat_client) -> None:
 
 
 async def demo_section4_approval_mode(chat_client) -> None:
-    """第4节：approval_mode=always_require 触发人工审批。"""
+    """第4节：approval_mode=always_require 触发人工审批。
+
+    关键流程（agent_framework 1.x 的审批协议）：
+        1. 第一次 agent.run()：模型返回 function_call 调 book_flight。
+        2. FunctionInvocationLayer 检测到该工具 approval_mode ==
+           "always_require"，**不执行**它，而是把每个 function_call 包成
+           Content(type="function_approval_request", ...) 放在
+           response.messages 里返回。
+        3. 调用方从 response.messages 里扫出这些 request 字段，提示用户
+           y/n；用户批准后用 Content.to_function_approval_response(
+           approved=True) 把它转成 response，把所有 response 拼成一条
+           新的 user/assistant 消息喂回 agent.run()。
+        4. 第二次 run：模型看到 function_result 里有"已批准"标识，
+           框架执行 book_flight，工具结果作为 function_result 回流，
+           模型据此生成最终回复。
+    """
     print("=" * 60)
     print("Section 4: Tool approval mode")
     print("第4节：工具审批模式")
@@ -531,19 +651,65 @@ async def demo_section4_approval_mode(chat_client) -> None:
     approval_demo_agent = chat_client.as_agent(
         name="BookingAgent",
         instructions=(
-            "You are a travel booking assistant. Use the tools to book "
-            "flights when the user provides origin, destination, and "
-            "passenger name. The book_flight tool requires approval."
-            " 你是一名旅行预订助理。请使用工具在用户提供出发地、目的地、"
-            "乘客姓名后预订航班；book_flight 工具需要审批。"
+            "你是一名旅行预订助理。请在用户提供出发地、目的地和乘客姓名后"
+            "使用工具预订航班；book_flight 工具需要审批。"
+            "所有回复必须使用中文。"
         ),
         tools=[check_availability, get_flight_info, book_flight],
     )
 
+    # 关键：approval 走"两轮 run"协议，
+    # 第 1 轮模型返回 function_call
+    # 后框架拦截、把它包成 function_approval_request 留在 assistant消息里；
+    # 第 2 轮 framework 又需要把那条 assistant 消息 + 用户的
+    # approval_response 一起送给 chat client，才能让服务端在同一个
+    # tool_call_id 上对应起 function_call/function_result。
+    # 显式开一个 AgentSession 让 framework 自动维护这段历史。
+    from agent_framework import AgentSession
+    session = AgentSession()
+
+    # ---- 第 1 轮：等模型发出审批请求 ----
     response = await approval_demo_agent.run(
-        "Please book a flight from LHR to BCN for passenger Alice Smith."
+        "请帮我为乘客 Alice Smith 预订一班从 LHR 到 BCN 的航班。",
+        session=session,
     )
-    print(response)
+
+    # 扫出所有 function_approval_request
+    from agent_framework import Message
+    import json as _json_approval
+
+    approval_requests = [
+        c
+        for m in (response.messages or [])
+        for c in (m.contents or [])
+        if getattr(c, "type", None) == "function_approval_request"
+    ]
+    if not approval_requests:
+        # 走到这里说明模型没调工具，审批路径没触发
+        print(response)
+        print("[INFO] 模型未触发审批（可能没调 book_flight），跳过第二轮。")
+        return
+
+    print("模型请求执行以下需要审批的工具：")
+    for c in approval_requests:
+        fc = c.function_call
+        print(f"  - {fc.name}({_json_approval.dumps(fc.arguments, ensure_ascii=False)})")
+
+    # 把所有 request 转成 response（全部批准；要"全部拒绝"传 False）
+    approval_responses = [
+        c.to_function_approval_response(approved=True)
+        for c in approval_requests
+    ]
+
+    # ---- 第 2 轮：把"批准"内容喂回 agent.run() ----
+    # 同一 session 让 framework 自动把第 1 轮的 assistant(approval_request)
+    # 重新塞回 prepped_messages；再把 approval_response 作为新的 input。
+    # framework 内部的 _replace_approval_contents_with_results 会就地
+    # 把 approval_request 还原成 function_call、把 approval_response
+    # 替换成 function_result（msg.role="tool"），再调 chat client。
+    follow_up_msg = Message(role="user", contents=approval_responses)
+    final = await approval_demo_agent.run(follow_up_msg, session=session)
+    print(final)
     print()
 
 
@@ -575,9 +741,9 @@ async def main() -> None:
     # 顺序与 1/2/3/3.1/4 一致；要跳过某节，注释掉对应行即可
     # await demo_section1_tool_definitions()
     # await demo_section2_multi_tool_agent(chat_client)
-    await demo_section3_structured_output(chat_client)
+    # await demo_section3_structured_output(chat_client)
     # await demo_section3_1_two_phase(chat_client)
-    # await demo_section4_approval_mode(chat_client)
+    await demo_section4_approval_mode(chat_client)
     # await demo_summary()
 
 
